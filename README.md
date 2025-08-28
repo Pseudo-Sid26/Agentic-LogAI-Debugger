@@ -195,6 +195,27 @@ To run the analytics dashboard:
 
 The dashboard will be available at [http://localhost:8501](http://localhost:8501).
 
+### New React Frontend (optional)
+
+This repo now includes a React + Vite frontend under `frontend/` and a FastAPI proxy under `backend/services/main.py`.
+
+Run the API (in one terminal):
+
+```bash
+pip install -r requirements.txt
+python -m uvicorn backend.services.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Run the React app (in another terminal):
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Open http://localhost:5173. The dev server proxies `/api/*` to the FastAPI server.
+
 ## Contributing
 
 1. Fork the repository
