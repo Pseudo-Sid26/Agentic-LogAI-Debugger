@@ -1,13 +1,37 @@
-# LogAnalytics React Frontend
+# Agentic LogAI Frontend (React + Vite)
 
-A minimal, performant React + Vite + TypeScript UI for browsing Loki logs via the FastAPI proxy.
+A React (JavaScript) dashboard for the FastAPI backend in `backend/services/main.py`.
 
-- Dev server: http://localhost:5173
-- API proxy: http://localhost:8000
+- Dev server: Vite on http://localhost:5173
+- Proxy: `/api` -> http://localhost:8000 (FastAPI)
+- Styling: Tailwind CSS
+- Routing: React Router v6
+- Charts: Recharts
 
-## Quick start
+## Setup
 
-1. Install Python deps and run API
-2. Install Node deps and run dev server
+1. Install Node.js 18+
+2. Install deps
 
-See root README for commands.
+```powershell
+cd frontend
+npm install
+```
+
+3. Start backend (FastAPI) on port 8000
+4. Run frontend
+
+```powershell
+npm run dev
+```
+
+## Build
+
+```powershell
+npm run build
+npm run preview
+```
+
+## Notes
+- Adjust the proxy target in `vite.config.js` if your backend runs elsewhere.
+- Ensure CORS in FastAPI allows `http://localhost:5173` (already configured).

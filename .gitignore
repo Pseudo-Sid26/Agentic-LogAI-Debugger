@@ -4,6 +4,12 @@
 *.pyc
 .DS_Store
 data/wal/
+.env.local
+venv/
+.venv/
+node_modules/
+frontend/node_modules/
+data/uploads/
 .venv/
 __pycache__/
 *.pyc

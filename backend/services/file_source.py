@@ -85,6 +85,15 @@ def get_metrics(start: datetime, end: datetime, interval: str = '5m', path: str 
         'info': list(zip(buckets, counts['info']))
     }
 
+
+def query_tail(limit: int = 100, path: str = DEFAULT_LOG_PATH) -> List[Dict]:
+    """Return the latest N entries from the file, regardless of time window."""
+    items = list(_iter_entries(path))
+    if not items:
+        return []
+    items.sort(key=lambda e: e['timestamp'], reverse=True)
+    return items[:max(1, limit)]
+
 def get_label_values(label: str, path: str = DEFAULT_LOG_PATH) -> List[str]:
     values = set()
     for e in _iter_entries(path):
@@ -95,3 +104,28 @@ def get_label_values(label: str, path: str = DEFAULT_LOG_PATH) -> List[str]:
             if v:
                 values.add(v)
     return sorted(values)
+
+
+def recent_entries(limit: int = 1000, path: str = DEFAULT_LOG_PATH) -> List[Dict]:
+    """Return the most recent parsed entries ignoring any time window.
+
+    This is used as a fallback when a narrow lookback returns no rows.
+    """
+    items = [e for e in _iter_entries(path)]
+    items.sort(key=lambda e: e['timestamp'], reverse=True)
+    return items[:limit]
+
+
+def time_bounds(path: str = DEFAULT_LOG_PATH) -> Tuple[datetime, datetime] | None:
+    """Return (min_ts, max_ts) for parsed entries, or None if none found."""
+    min_ts = None
+    max_ts = None
+    for e in _iter_entries(path):
+        ts = e['timestamp']
+        if min_ts is None or ts < min_ts:
+            min_ts = ts
+        if max_ts is None or ts > max_ts:
+            max_ts = ts
+    if min_ts is None or max_ts is None:
+        return None
+    return (min_ts, max_ts)

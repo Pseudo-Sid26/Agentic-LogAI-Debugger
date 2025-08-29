@@ -1118,3 +1118,132 @@ def main():
 if __name__ == "__main__":
     # Remove duplicate function and use the main function
     main()
+
+# --- LLM-assisted fix helper ---
+
+def apply_fix_with_llm(
+    file_path: str,
+    related_code: str = "",
+    instruction: str = "",
+    create_backup: bool = True,
+) -> str:
+    """Use an LLM to propose a code change given an instruction, then apply it.
+
+    Returns a JSON string with success, file, changed, and diff fields.
+    """
+    try:
+        suggestion = generate_suggestion_with_llm(file_path=file_path, related_code=related_code, instruction=instruction)
+        if not suggestion:
+            return json.dumps({"success": False, "message": "LLM did not return a suggestion"})
+        return apply_code_fix(file_path=file_path, related_code=related_code, code_suggestion=suggestion, create_backup=create_backup)
+    except Exception as e:
+        return json.dumps({"success": False, "message": f"LLM-assisted fix failed: {e}"})
+
+
+def generate_suggestion_with_llm(file_path: str, related_code: str = "", instruction: str = "") -> str:
+    """Return a minimal code suggestion string from the configured LLM."""
+    llm = get_llm(temperature=float(os.getenv("LLM_TEMPERATURE", "0.2")))
+    from langchain.prompts import ChatPromptTemplate
+
+    prompt = ChatPromptTemplate.from_template(
+        """
+You are an expert software engineer. Generate a minimal, drop-in code change for the given file.
+Constraints:
+- Preserve surrounding context and style.
+- Return ONLY the replacement snippet (no commentary, no markdown).
+
+File path: {file_path}
+Instruction: {instruction}
+Related code (match target):
+"""
+    )
+    msg = prompt.format_messages(file_path=file_path, instruction=instruction)
+    if related_code:
+        msg[-1].content = msg[-1].content + "\n" + related_code
+    out = llm.invoke(msg)
+    return (getattr(out, "content", None) or "").strip()
+
+
+def preview_code_fix(
+    file_path: str,
+    related_code: str = "",
+    code_suggestion: str = "",
+    instruction: str = "",
+    use_llm: bool = False,
+    encoding: str = "utf-8",
+) -> str:
+    """Compute the diff of the proposed change without writing the file.
+
+    Returns JSON with: success, file, changed, diff, suggestion
+    """
+    try:
+        resolver = FilePathResolver(root_dir=".")
+        resolved = resolver.find_file(file_path)
+        if not resolved:
+            return json.dumps({"success": False, "file": file_path, "changed": False, "message": "File not found via resolver"})
+
+        with open(resolved, 'r', encoding=encoding) as f:
+            original = f.read()
+
+        # Obtain suggestion via LLM if desired
+        suggestion = code_suggestion
+        if (use_llm or not suggestion):
+            try:
+                suggestion = generate_suggestion_with_llm(file_path=resolved, related_code=related_code, instruction=instruction)
+            except Exception:
+                suggestion = suggestion or ""
+
+        # Determine new content using the same rules as apply_code_fix
+        new_content = None
+        if related_code and related_code in original and suggestion:
+            new_content = original.replace(related_code, suggestion)
+        else:
+            norm_original = _normalize_ws(original)
+            norm_related = _normalize_ws(related_code or "")
+            if norm_related and norm_related in norm_original and suggestion:
+                new_content = original + "\n\n# --- AI Suggested Fix Applied (preview) ---\n" + suggestion + "\n"
+            else:
+                first_line = ""
+                for ln in (related_code or "").splitlines():
+                    if ln.strip():
+                        first_line = ln.strip()
+                        break
+                if first_line and first_line in original and suggestion:
+                    new_content = original.replace(first_line, suggestion)
+                else:
+                    if suggestion:
+                        new_content = original + "\n\n# --- AI Suggested Fix (preview, could not locate exact snippet) ---\n" + suggestion + "\n"
+                    else:
+                        new_content = original
+
+        if new_content == original:
+            return json.dumps({
+                "success": True,
+                "file": resolved,
+                "changed": False,
+                "message": "No changes would be made",
+                "diff": "",
+                "suggestion": suggestion,
+            })
+
+        import difflib
+        diff = "\n".join(
+            difflib.unified_diff(
+                original.splitlines(),
+                new_content.splitlines(),
+                fromfile=resolved,
+                tofile=f"{resolved} (preview)",
+                lineterm="",
+            )
+        )
+
+        return json.dumps({
+            "success": True,
+            "file": resolved,
+            "changed": True,
+            "message": "Preview generated",
+            "diff": diff,
+            "suggestion": suggestion,
+        })
+    except Exception as e:
+        return json.dumps({"success": False, "file": file_path, "changed": False, "message": f"Error generating preview: {e}"})

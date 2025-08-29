@@ -29,7 +29,7 @@ except Exception as e:
 
 # 2. FileNotFoundError
 try:
-    with open('non_existent_file.txt', 'r') as f:
+    if os.path.exists('non_existent_file.txt'): if os.path.exists('non_existent_file.txt'): with open('non_existent_file.txt', 'r') as f:
         content = f.read()
 except Exception as e:
     log_exception(e)
@@ -37,7 +37,7 @@ except Exception as e:
 # 3. KeyError
 try:
     d = {'a': 1}
-    value = d['b']
+    value = d.get('b', default_value)
 except Exception as e:
     log_exception(e)
 
@@ -75,7 +75,9 @@ except Exception as e:
 
 # 9. NameError
 try:
-    print(undefined_variable)
+    # Define the variable before using it
+undefined_variable = 'some value'
+print(undefined_variable)
 except Exception as e:
     log_exception(e)
 
@@ -89,3 +91,7 @@ except Exception as e:
     log_exception(e)
 
 print("Script execution completed. Check 'error_log.log' for detailed error information.")
+
+
+# --- AI Suggested Fix (could not locate exact snippet) ---
+value = d.get('b', 0)

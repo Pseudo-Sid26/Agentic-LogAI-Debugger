@@ -13,6 +13,9 @@ from .file_source import (
 	get_metrics as file_get_metrics,
 	get_label_values as file_get_label_values,
 	DEFAULT_LOG_PATH,
+	LINE_RE,
+	recent_entries as file_recent_entries,
+	time_bounds as file_time_bounds,
 )
 
 
@@ -45,6 +48,7 @@ import json
 from glob import glob
 from pathlib import Path
 import time
+import hashlib
 
 
 def _repo_root() -> Path:
@@ -62,6 +66,36 @@ def _latest_analysis_file() -> Path | None:
 		reverse=True,
 	)
 	return files[0] if files else None
+
+
+def _resolved_state_path() -> Path:
+	return _repo_root() / "data" / "resolved.json"
+
+
+def _load_resolved() -> set[str]:
+	try:
+		with open(_resolved_state_path(), "r", encoding="utf-8") as f:
+			return set(json.load(f))
+	except Exception:
+		return set()
+
+
+def _save_resolved(s: set[str]):
+	p = _resolved_state_path()
+	p.parent.mkdir(parents=True, exist_ok=True)
+	with open(p, "w", encoding="utf-8") as f:
+		json.dump(sorted(list(s)), f, indent=2)
+
+
+def _fingerprint(item: dict) -> str:
+	"""Create a stable fingerprint for a resolution item."""
+	key = "|".join([
+		str(item.get("file_location", "")),
+		str(item.get("line_number", "")),
+		str(item.get("error_type", "")),
+		(item.get("related_code", "") or "")[:200],
+	])
+	return hashlib.sha256(key.encode("utf-8", errors="ignore")).hexdigest()
 
 
 # ---------- File source selection & uploads ----------
@@ -143,17 +177,22 @@ def get_logs(
 ):
 	"""Return logs from Loki for the last N minutes, with a simple level extraction."""
 	rows = []
-	# Choose source
-	if source in ("auto", "loki"):
+	# In auto mode, prefer user-selected file if one was set via state.json
+	prefer_file_first = source == "auto" and bool(_read_state().get("active_file"))
+	if source in ("auto", "file") and prefer_file_first:
+		end_local = datetime.now()
+		start_local = end_local - timedelta(minutes=minutes)
+		rows = file_query_range(query=query, start=start_local, end=end_local, limit=limit, path=_get_active_file())
+	# Then try Loki if allowed and still empty
+	if source in ("auto", "loki") and not rows:
 		client = LokiClient()
 		end_time = datetime.utcnow()
 		start_time = end_time - timedelta(minutes=minutes)
 		rows = client.query_range(query=query, start=start_time, end=end_time, limit=limit)
+	# Finally fallback to file if allowed and still empty
 	if source in ("auto", "file") and not rows:
-		# File source uses local timestamps
-		end_local = datetime.now()
-		start_local = end_local - timedelta(minutes=minutes)
-		rows = file_query_range(query=query, start=start_local, end=end_local, limit=limit, path=_get_active_file())
+		# Last resort: recent entries ignoring time window
+		rows = file_recent_entries(limit=limit, path=_get_active_file())
 
 	def level_of(msg: str) -> str:
 		m = msg.upper()
@@ -188,17 +227,68 @@ def get_metrics(
 	source: str = Query(default="auto", pattern="^(auto|file|loki)$", description="Data source: auto, file, or loki"),
 ):
 	"""Return simple level timeseries computed by Loki using count_over_time."""
-	# Choose source
+	# Choose source with correct precedence and windows
 	metrics = {"errors": [], "warnings": [], "info": []}
-	if source in ("auto", "loki"):
+
+	def has_points(m: dict) -> bool:
+		series = m.get("errors", []) + m.get("warnings", []) + m.get("info", [])
+		if not series:
+			return False
+		# Consider populated only if there are any non-zero values
+		return any(v > 0 for _, v in series)
+
+	end_local = datetime.now()
+	start_local = end_local - timedelta(minutes=minutes)
+	active_file = bool(_read_state().get("active_file"))
+
+	# 1) File path
+	if source == "file" or (source == "auto" and active_file):
+		metrics = file_get_metrics(start=start_local, end=end_local, interval=interval, path=_get_active_file())
+
+	# 2) Loki path
+	if not has_points(metrics) and (source == "loki" or source == "auto"):
 		client = LokiClient()
 		end_time = datetime.utcnow()
 		start_time = end_time - timedelta(minutes=minutes)
 		metrics = client.get_metrics(start=start_time, end=end_time, interval=interval)
-	if source in ("auto", "file") and not any(metrics.values()):
-		end_local = datetime.now()
-		start_local = end_local - timedelta(minutes=minutes)
-		metrics = file_get_metrics(start=start_local, end=end_local, interval=interval, path=_get_active_file())
+
+	# 3) Fallback: full file time-bounds if still empty and file is allowed
+	if not has_points(metrics) and (source == "file" or source == "auto"):
+		bounds = file_time_bounds(path=_get_active_file())
+		if bounds:
+			metrics = file_get_metrics(start=bounds[0], end=bounds[1], interval=interval, path=_get_active_file())
+	# If we only have a single bucket, pad with surrounding zero buckets for better chart UX
+	def parse_delta(s: str):
+		try:
+			n = int(s[:-1]); u = s[-1]
+			return timedelta(minutes=n) if u == 'm' else timedelta(hours=n)
+		except Exception:
+			return timedelta(minutes=5)
+
+	def pad_single_bucket(m: dict, interval_str: str) -> dict:
+		series_lens = [len(m.get(k, [])) for k in ("errors", "warnings", "info")]
+		if max(series_lens or [0]) > 1:
+			return m
+		# Center timestamp: pick the first available ts or now
+		ts0 = None
+		for k in ("errors", "warnings", "info"):
+			if m.get(k):
+				ts0 = m[k][0][0]
+				break
+		if not ts0:
+			ts0 = datetime.utcnow()
+		delta = parse_delta(interval_str)
+		buckets = [ts0 + delta * i for i in (-2, -1, 0, 1, 2)]
+		# Sum original single values (if present)
+		vals = {k: (m.get(k)[0][1] if m.get(k) else 0) for k in ("errors", "warnings", "info")}
+		return {
+			"errors": [(t, vals["errors"] if i == 2 else 0) for i, t in enumerate(buckets)],
+			"warnings": [(t, vals["warnings"] if i == 2 else 0) for i, t in enumerate(buckets)],
+			"info": [(t, vals["info"] if i == 2 else 0) for i, t in enumerate(buckets)],
+		}
+
+	metrics = pad_single_bucket(metrics, interval)
+
 	# Ensure timestamps are ISO strings for the frontend
 	def serialize(series):
 		return [(ts.isoformat() if hasattr(ts, "isoformat") else ts, val) for ts, val in series]
@@ -217,6 +307,27 @@ def get_label_values(label: str):
 	return {"label": label, "values": values}
 
 
+@app.get("/api/loki/status")
+def loki_status():
+	"""Quick connectivity check for Loki: version & basic health."""
+	import requests
+	client = LokiClient()
+	info = {"url": client.url}
+	try:
+		r = requests.get(f"{client.url}/ready")
+		info["ready"] = r.status_code == 200
+	except Exception as e:
+		info["ready"] = False
+		info["error"] = str(e)
+	try:
+		r2 = requests.get(f"{client.url}/loki/api/v1/status/buildinfo")
+		if r2.ok:
+			info["buildinfo"] = r2.json().get("version", "unknown")
+	except Exception:
+		pass
+	return info
+
+
 @app.get("/api/resolutions")
 def get_resolutions():
 	"""Return recommended resolutions from the latest analysis JSON produced by the agent toolkit."""
@@ -227,7 +338,16 @@ def get_resolutions():
 		with open(path, "r", encoding="utf-8") as f:
 			data = json.load(f)
 		items = _flatten_analysis_payload(data)
-		return {"items": items, "count": len(items), "source": path.name}
+		resolved = _load_resolved()
+		# Attach fingerprint and filter out resolved ones
+		annotated = []
+		for it in items:
+			fp = _fingerprint(it)
+			if fp in resolved:
+				continue
+			it["_fp"] = fp
+			annotated.append(it)
+		return {"items": annotated, "count": len(annotated), "source": path.name}
 	except Exception:
 		return {"items": [], "count": 0}
 
@@ -235,8 +355,11 @@ def get_resolutions():
 class FixPayload(BaseModel):
 	file_location: str
 	related_code: str | None = None
-	code_suggestion: str
+	code_suggestion: str | None = ""
+	instruction: str | None = ""
+	use_llm: bool = False
 	create_backup: bool = True
+	fingerprint: str | None = None
 
 
 @app.post("/api/fix/apply")
@@ -245,14 +368,75 @@ def apply_fix(payload: FixPayload):
 	# Local import to avoid backend hard dependency if toolkit isn’t present
 	try:
 		from agent_with_toolkit.ToolKit import apply_code_fix  # type: ignore
+		# Optional LLM-assisted path
+		try:
+			from agent_with_toolkit.ToolKit import apply_fix_with_llm, preview_code_fix  # type: ignore
+		except Exception:
+			apply_fix_with_llm = None  # type: ignore
+			preview_code_fix = None  # type: ignore
 	except Exception as e:
 		return {"success": False, "message": f"Toolkit not available: {e}"}
+
+	# If requested (or no code_suggestion provided), try LLM-assisted suggestion first
+	if (payload.use_llm or not payload.code_suggestion) and apply_fix_with_llm is not None:
+		try:
+			res = apply_fix_with_llm(
+				file_path=payload.file_location,
+				related_code=payload.related_code or "",
+				instruction=payload.instruction or "",
+				create_backup=payload.create_backup,
+			)
+			return json.loads(res)
+		except Exception:
+			# Fall back to direct apply if LLM path fails for any reason
+			pass
 
 	res = apply_code_fix(
 		file_path=payload.file_location,
 		related_code=payload.related_code or "",
-		code_suggestion=payload.code_suggestion,
+		code_suggestion=payload.code_suggestion or "",
 		create_backup=payload.create_backup,
+	)
+	try:
+		result = json.loads(res)
+		# On success, record this resolution as resolved (if we can fingerprint it)
+		if result.get("success"):
+			it = {
+				"file_location": payload.file_location,
+				"line_number": None,
+				"error_type": "",
+				"related_code": payload.related_code or "",
+			}
+			fp = payload.fingerprint or _fingerprint(it)
+			s = _load_resolved(); s.add(fp); _save_resolved(s)
+		return result
+	except Exception:
+		return {"success": False, "message": "Invalid tool response"}
+
+
+class MarkResolvedPayload(BaseModel):
+	fingerprint: str
+
+
+@app.post("/api/resolutions/mark-resolved")
+def mark_resolved(payload: MarkResolvedPayload):
+	s = _load_resolved(); s.add(payload.fingerprint); _save_resolved(s)
+	return {"ok": True}
+
+
+@app.post("/api/fix/preview")
+def preview_fix(payload: FixPayload):
+	"""Return a unified diff for the proposed fix without modifying files."""
+	try:
+		from agent_with_toolkit.ToolKit import preview_code_fix  # type: ignore
+	except Exception as e:
+		return {"success": False, "message": f"Toolkit not available: {e}"}
+	res = preview_code_fix(
+		file_path=payload.file_location,
+		related_code=payload.related_code or "",
+		code_suggestion=payload.code_suggestion or "",
+		instruction=payload.instruction or "",
+		use_llm=payload.use_llm,
 	)
 	try:
 		return json.loads(res)
@@ -305,7 +489,27 @@ async def upload_log_file(file: UploadFile = File(...)):
 	except Exception as e:
 		raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
 	_set_active_file(str(target))
-	return {"ok": True, "stored_as": str(target), "active_file": _get_active_file(), "bytes": len(content)}
+	# Quick parse stats to help frontend UX
+	total_lines = 0
+	matched = 0
+	try:
+		with open(target, "r", encoding="utf-8", errors="ignore") as f:
+			for i, line in enumerate(f, 1):
+				total_lines = i
+				if LINE_RE.match(line.rstrip("\n")):
+					matched += 1
+				if i >= 2000:  # sample first 2k lines
+					break
+	except Exception:
+		pass
+	return {
+		"ok": True,
+		"stored_as": str(target),
+		"active_file": _get_active_file(),
+		"bytes": len(content),
+		"sampled_lines": total_lines,
+		"matched_lines": matched,
+	}
 
 
 # Optional: uvicorn entrypoint (not used if launched via uvicorn CLI)

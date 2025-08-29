@@ -13,20 +13,21 @@ from services.network_client import NetworkClient
 
 # --- Configuration ---
 LOG_FILENAME = 'simulated_system.log'
-SIMULATION_DURATION_SECONDS = 60 # Run for 60 seconds
-LOG_LEVEL = logging.DEBUG # Set to INFO for less verbose logs, DEBUG for more detail
-MAX_LOG_VOLUME_APPROX = 50000 # Target approx log lines (adjust duration/intensity)
-INTENSITY_FACTOR = 10 # Higher number means more operations per second
+SIMULATION_DURATION_SECONDS = 15  # shorter for quick pipeline demo
+LOG_LEVEL = logging.DEBUG  # Set to INFO for less verbose logs, DEBUG for more detail
+MAX_LOG_VOLUME_APPROX = 50000  # Target approx log lines (adjust duration/intensity)
+INTENSITY_FACTOR = 10  # Higher number means more operations per second
 
 # --- Logging Setup ---
 def setup_logging():
     """Configures the root logger."""
     logging.basicConfig(
         level=LOG_LEVEL,
-        format='%(asctime)s - %(levelname)s - %(name)s - %(funcName)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S,%f', # Added milliseconds
+        # Add milliseconds explicitly, since strftime doesn't support %f
+        format='%(asctime)s,%(msecs)03d - %(levelname)s - %(name)s - %(funcName)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
         filename=LOG_FILENAME,
-        filemode='w' # Overwrite log file on each run
+        filemode='w'  # Overwrite log file on each run
     )
     # Optional: Add a handler to also print logs to console
     console_handler = logging.StreamHandler(sys.stdout)
@@ -64,13 +65,21 @@ def run_simulation(duration_seconds, intensity):
                 if operation == 'get_user':
                     user_svc.get_user(random.randint(1000, 5000))
                 elif operation == 'update_profile':
-                    user_svc.update_profile(random.randint(1000, 5000), {'pref': random.choice()})
+                    user_svc.update_profile(
+                        random.randint(1000, 5000),
+                        {'pref': random.choice(['dark', 'light', 'system'])}
+                    )
                 elif operation == 'process_payment':
                     payment_svc.process_payment(random.uniform(5.0, 500.0), random.randint(1000, 5000))
                 elif operation == 'refund_payment':
                     payment_svc.refund_payment(f"txn_{random.randint(10000, 99999)}")
                 elif operation == 'db_query':
-                    query = random.choice()
+                    query = random.choice([
+                        "SELECT * FROM users WHERE id = %s",
+                        "UPDATE payments SET status='OK' WHERE id = %s",
+                        "DELETE FROM sessions WHERE last_seen < NOW() - interval '7 days'",
+                        "INSERT INTO audit(event) VALUES('login')"
+                    ])
                     db_conn.query(query)
                 elif operation == 'db_check':
                     db_conn.check_connection()
