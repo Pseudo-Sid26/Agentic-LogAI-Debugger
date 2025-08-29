@@ -7,5 +7,12 @@ langchain-community>=0.0.10
 watchdog>=3.0.0
 rich==13.7.0
 click==8.1.7
-grafana-loki-client==0.1.0
 matplotlib>=3.8.0
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-logging-loki>=0.3.1
+python-json-logger>=2.0.7
+langchain-openai>=0.1.0
+langchain-groq>=0.1.4
+langchain-google-genai>=2.0.0
+python-multipart>=0.0.9

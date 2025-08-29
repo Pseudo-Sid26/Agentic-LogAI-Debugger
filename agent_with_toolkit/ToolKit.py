@@ -4,9 +4,42 @@ import json
 import time  # Add missing import for time functions
 from typing import List, Dict, Any, Optional, Set, Union
 from pydantic import BaseModel, Field
-from langchain_community.chat_models import ChatOpenAI
+from langchain_community.chat_models import ChatOpenAI as CommunityChatOpenAI
 from langchain.agents import Tool, initialize_agent, AgentType
 from langchain.memory import ConversationBufferMemory
+
+
+def get_llm(model_name: str | None = None, temperature: float = 0.2):
+    """Return a LangChain chat model using any available provider.
+
+    Order preference: OPENAI_API_KEY -> GROQ_API_KEY -> GOOGLE_API_KEY.
+    Uses provider-specific packages if present; otherwise raises with guidance.
+    """
+    import os
+    # Allow env to override model names
+    openai_model = os.getenv("OPENAI_MODEL", model_name or "gpt-4o-mini")
+    groq_model = os.getenv("GROQ_MODEL", model_name or "llama-3.3-70b-versatile")
+    google_model = os.getenv("GOOGLE_MODEL", model_name or "gemini-1.5-flash")
+    if os.getenv("OPENAI_API_KEY"):
+        try:
+            from langchain_openai import ChatOpenAI  # type: ignore
+            return ChatOpenAI(model=openai_model, temperature=temperature)
+        except Exception:
+            # Fallback to community wrapper if openai package not available
+            return CommunityChatOpenAI(model=openai_model, temperature=temperature)
+    if os.getenv("GROQ_API_KEY"):
+        try:
+            from langchain_groq import ChatGroq  # type: ignore
+            return ChatGroq(model=groq_model, temperature=temperature)
+        except Exception as e:
+            raise RuntimeError("GROQ_API_KEY set but 'langchain-groq' is not installed.") from e
+    if os.getenv("GOOGLE_API_KEY"):
+        try:
+            from langchain_google_genai import ChatGoogleGenerativeAI  # type: ignore
+            return ChatGoogleGenerativeAI(model=google_model, temperature=temperature)
+        except Exception as e:
+            raise RuntimeError("GOOGLE_API_KEY set but 'langchain-google-genai' is not installed.") from e
+    raise RuntimeError("No API key found. Set OPENAI_API_KEY, GROQ_API_KEY, or GOOGLE_API_KEY.")
 
 
 class FilePathResolver:
@@ -51,19 +84,18 @@ class FilePathResolver:
         # Case 1: Exact match (absolute or relative path)
         if os.path.isfile(file_hint):
             return os.path.abspath(file_hint)
-        
+
         # Case 2: Try as a relative path from root_dir
         rel_path = os.path.join(self.root_dir, file_hint)
         if os.path.isfile(rel_path):
             return os.path.abspath(rel_path)
-        
+
         # Case 3: Match by filename only
         filename = os.path.basename(file_hint)
         if filename in self._file_cache["by_name"]:
             matches = self._file_cache["by_name"][filename]
             if len(matches) == 1:
                 return matches[0]
-            
             # If multiple matches, prefer files that match more of the path
             if len(matches) > 1 and '/' in file_hint:
                 path_parts = file_hint.split('/')
@@ -76,20 +108,17 @@ class FilePathResolver:
                         best_match = match
                 if best_match:
                     return best_match
-            
             # Default to the first match with a warning
             return matches[0]
-        
+
         # Case 4: Fuzzy match - file contains the hint
         possible_matches = []
         for full_path in self._file_cache["all_files"]:
             if filename.lower() in full_path.lower():
                 possible_matches.append(full_path)
-        
         if possible_matches:
             # Return the shortest match as it's likely the most specific
             return min(possible_matches, key=len)
-            
         # No matches found
         return None
     
@@ -690,17 +719,135 @@ def save_analysis_to_json(analysis: str, output_file: str = "error_analysis.json
                 return "Error: Could not extract any valid JSON objects"
             
             json_data = json_objects if len(json_objects) > 1 else json_objects[0]
-
-            res = {"json_object": json_data}
         
         # Write to file
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(json_data, f, indent=2)
-        
-        return res
+        # Always return a normalized structure
+        return {"json_object": json_data, "output_file": output_file}
     
     except Exception as e:
         return None
+
+
+# --- Code Fix Application Utilities ---
+
+def _normalize_ws(s: str) -> str:
+    """Normalize whitespace for fuzzy matching."""
+    return "".join(s.split()) if isinstance(s, str) else ""
+
+
+def apply_code_fix(
+    file_path: str,
+    related_code: str,
+    code_suggestion: str,
+    create_backup: bool = True,
+    encoding: str = "utf-8",
+) -> str:
+    """
+    Apply a suggested code change to a file by replacing the related_code snippet.
+
+    Returns a JSON string with: success, file, backup, changed, message, diff
+    """
+    try:
+        resolver = FilePathResolver(root_dir=".")
+        resolved = resolver.find_file(file_path)
+        if not resolved:
+            return json.dumps({
+                "success": False,
+                "file": file_path,
+                "changed": False,
+                "message": "File not found via resolver"
+            })
+
+        with open(resolved, 'r', encoding=encoding) as f:
+            original = f.read()
+
+        # Attempt exact replacement first
+        new_content = None
+        if related_code and related_code in original:
+            new_content = original.replace(related_code, code_suggestion)
+        else:
+            # Fuzzy: ignore whitespace
+            norm_original = _normalize_ws(original)
+            norm_related = _normalize_ws(related_code or "")
+            if norm_related and norm_related in norm_original:
+                # As a fallback, append suggestion near the end with marker
+                new_content = original + "\n\n# --- AI Suggested Fix Applied ---\n" + code_suggestion + "\n"
+            else:
+                # Try to locate by first non-empty line
+                first_line = ""
+                for ln in (related_code or "").splitlines():
+                    if ln.strip():
+                        first_line = ln.strip()
+                        break
+                if first_line and first_line in original:
+                    new_content = original.replace(first_line, code_suggestion)
+                else:
+                    # As last resort, append suggestion with context header
+                    new_content = original + "\n\n# --- AI Suggested Fix (could not locate exact snippet) ---\n" + code_suggestion + "\n"
+
+        if new_content == original:
+            return json.dumps({
+                "success": True,
+                "file": resolved,
+                "changed": False,
+                "message": "No changes made (content identical)",
+                "diff": ""
+            })
+
+        backup_path = None
+        if create_backup:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            backup_path = f"{resolved}.bak_{ts}"
+            with open(backup_path, 'w', encoding=encoding) as b:
+                b.write(original)
+
+        # Write changes
+        with open(resolved, 'w', encoding=encoding) as f:
+            f.write(new_content)
+
+        import difflib
+        diff = "\n".join(
+            difflib.unified_diff(
+                original.splitlines(),
+                new_content.splitlines(),
+                fromfile=resolved,
+                tofile=f"{resolved} (modified)",
+                lineterm=""
+            )
+        )
+
+        return json.dumps({
+            "success": True,
+            "file": resolved,
+            "backup": backup_path,
+            "changed": True,
+            "message": "Fix applied",
+            "diff": diff
+        })
+
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "file": file_path,
+            "changed": False,
+            "message": f"Error applying fix: {e}"
+        })
+
+
+def _apply_code_fix_from_json(input_str: str) -> str:
+    """Tool wrapper that accepts a JSON string with the fix payload."""
+    try:
+        payload = json.loads(input_str)
+        return apply_code_fix(
+            file_path=payload.get("file_location") or payload.get("file") or "",
+            related_code=payload.get("related_code", ""),
+            code_suggestion=payload.get("code_suggestion", ""),
+            create_backup=payload.get("create_backup", True),
+        )
+    except Exception as e:
+        return json.dumps({"success": False, "message": f"Invalid input: {e}"})
 
 
 # --- Tool Creation Functions ---
@@ -815,6 +962,18 @@ def create_enhanced_tools() -> List[Tool]:
     
     # Combine all tools
     all_tools = code_tools + log_tools + error_tools
+    # Add code fix applicator tool
+    all_tools += [
+        Tool(
+            name="apply_code_fix",
+            func=_apply_code_fix_from_json,
+            description=(
+                "Apply an AI-suggested code fix. Input must be a JSON string with keys: "
+                "file_location, related_code, code_suggestion, create_backup (optional). "
+                "Returns a JSON string with success, message, and diff."
+            ),
+        )
+    ]
     
     return all_tools
 
@@ -827,7 +986,7 @@ def create_codebase_agent(model_name="gpt-4o", temperature=0):
     memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
     
     # Setup the agent with a system prompt that explains how to use the tools effectively
-    llm = ChatOpenAI(model=model_name, temperature=temperature)
+    llm = get_llm(model_name=model_name, temperature=temperature)
     
     system_prompt = """You are CodeExplorer, an AI assistant specialized in helping users understand codebases.
 
@@ -865,7 +1024,7 @@ def create_error_analysis_agent(model_name="gpt-4o", temperature=0.2):
     memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
     
     # Setup the agent with a system prompt specialized for error analysis
-    llm = ChatOpenAI(model=model_name, temperature=temperature)
+    llm = get_llm(model_name=model_name, temperature=temperature)
     
     system_prompt = """You are an expert Python error resolver. Your task is to analyze log files for errors and provide comprehensive solutions.
 
@@ -959,3 +1118,132 @@ def main():
 if __name__ == "__main__":
     # Remove duplicate function and use the main function
     main()
+
+# --- LLM-assisted fix helper ---
+
+def apply_fix_with_llm(
+    file_path: str,
+    related_code: str = "",
+    instruction: str = "",
+    create_backup: bool = True,
+) -> str:
+    """Use an LLM to propose a code change given an instruction, then apply it.
+
+    Returns a JSON string with success, file, changed, and diff fields.
+    """
+    try:
+        suggestion = generate_suggestion_with_llm(file_path=file_path, related_code=related_code, instruction=instruction)
+        if not suggestion:
+            return json.dumps({"success": False, "message": "LLM did not return a suggestion"})
+        return apply_code_fix(file_path=file_path, related_code=related_code, code_suggestion=suggestion, create_backup=create_backup)
+    except Exception as e:
+        return json.dumps({"success": False, "message": f"LLM-assisted fix failed: {e}"})
+
+
+def generate_suggestion_with_llm(file_path: str, related_code: str = "", instruction: str = "") -> str:
+    """Return a minimal code suggestion string from the configured LLM."""
+    llm = get_llm(temperature=float(os.getenv("LLM_TEMPERATURE", "0.2")))
+    from langchain.prompts import ChatPromptTemplate
+
+    prompt = ChatPromptTemplate.from_template(
+        """
+You are an expert software engineer. Generate a minimal, drop-in code change for the given file.
+Constraints:
+- Preserve surrounding context and style.
+- Return ONLY the replacement snippet (no commentary, no markdown).
+
+File path: {file_path}
+Instruction: {instruction}
+Related code (match target):
+"""
+    )
+    msg = prompt.format_messages(file_path=file_path, instruction=instruction)
+    if related_code:
+        msg[-1].content = msg[-1].content + "\n" + related_code
+    out = llm.invoke(msg)
+    return (getattr(out, "content", None) or "").strip()
+
+
+def preview_code_fix(
+    file_path: str,
+    related_code: str = "",
+    code_suggestion: str = "",
+    instruction: str = "",
+    use_llm: bool = False,
+    encoding: str = "utf-8",
+) -> str:
+    """Compute the diff of the proposed change without writing the file.
+
+    Returns JSON with: success, file, changed, diff, suggestion
+    """
+    try:
+        resolver = FilePathResolver(root_dir=".")
+        resolved = resolver.find_file(file_path)
+        if not resolved:
+            return json.dumps({"success": False, "file": file_path, "changed": False, "message": "File not found via resolver"})
+
+        with open(resolved, 'r', encoding=encoding) as f:
+            original = f.read()
+
+        # Obtain suggestion via LLM if desired
+        suggestion = code_suggestion
+        if (use_llm or not suggestion):
+            try:
+                suggestion = generate_suggestion_with_llm(file_path=resolved, related_code=related_code, instruction=instruction)
+            except Exception:
+                suggestion = suggestion or ""
+
+        # Determine new content using the same rules as apply_code_fix
+        new_content = None
+        if related_code and related_code in original and suggestion:
+            new_content = original.replace(related_code, suggestion)
+        else:
+            norm_original = _normalize_ws(original)
+            norm_related = _normalize_ws(related_code or "")
+            if norm_related and norm_related in norm_original and suggestion:
+                new_content = original + "\n\n# --- AI Suggested Fix Applied (preview) ---\n" + suggestion + "\n"
+            else:
+                first_line = ""
+                for ln in (related_code or "").splitlines():
+                    if ln.strip():
+                        first_line = ln.strip()
+                        break
+                if first_line and first_line in original and suggestion:
+                    new_content = original.replace(first_line, suggestion)
+                else:
+                    if suggestion:
+                        new_content = original + "\n\n# --- AI Suggested Fix (preview, could not locate exact snippet) ---\n" + suggestion + "\n"
+                    else:
+                        new_content = original
+
+        if new_content == original:
+            return json.dumps({
+                "success": True,
+                "file": resolved,
+                "changed": False,
+                "message": "No changes would be made",
+                "diff": "",
+                "suggestion": suggestion,
+            })
+
+        import difflib
+        diff = "\n".join(
+            difflib.unified_diff(
+                original.splitlines(),
+                new_content.splitlines(),
+                fromfile=resolved,
+                tofile=f"{resolved} (preview)",
+                lineterm="",
+            )
+        )
+
+        return json.dumps({
+            "success": True,
+            "file": resolved,
+            "changed": True,
+            "message": "Preview generated",
+            "diff": diff,
+            "suggestion": suggestion,
+        })
+    except Exception as e:
+        return json.dumps({"success": False, "file": file_path, "changed": False, "message": f"Error generating preview: {e}"})

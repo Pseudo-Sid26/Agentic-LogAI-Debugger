@@ -11,7 +11,8 @@ if parent_dir not in sys.path:
     sys.path.append(parent_dir)
 
 # Import agent functionality
-from agent import analyze_logs
+from agent import analyze_logs, apply_fix_with_agent
+from ToolKit import apply_code_fix
 
 # Set page configuration
 st.set_page_config(
@@ -296,6 +297,14 @@ def run_analysis():
         st.session_state.analyzing = False
         return False
 
+# Sidebar to mirror the asset's navigation
+with st.sidebar:
+    st.markdown("## Enhanced LogAnalytics")
+    st.markdown("Upload Log File")
+    st.file_uploader("Drag and drop file here", type=["log", "txt"], help="Limit 200MB per file - LOG, TXT")
+    st.markdown("---")
+    st.radio("Navigation", ["Dashboard", "Error Patterns", "Comprehensive Analysis", "Fix Recommendations", "Settings"], index=0)
+
 # Custom header
 st.markdown("""
 <div class="dashboard-header">
@@ -423,17 +432,28 @@ with right_col:
                 <div class="code-block">{code_suggestion}</div>
             </div>
             
-            <div class="action-buttons">
-                <button class="apply-fix-btn">
-                    <span>✓</span> Apply Fix
-                </button>
-                <button class="dismiss-btn">
-                    <span>✗</span> Dismiss
-                </button>
-            </div>
+            <div class="action-buttons"></div>
             <div class="occurrence-info">Based on {occurrences} error occurrences</div>
         </div>
         """, unsafe_allow_html=True)
+
+        # Real Streamlit action buttons below the rendered card
+        c1, c2, c3 = st.columns([1, 1, 2])
+        with c1:
+            if st.button("Apply Fix", key=f"apply_{i}"):
+                # Prefer executing via our agent (which will use the toolkit tool internally)
+                res_json = apply_fix_with_agent(error)
+                if res_json.get("success"):
+                    st.success(f"Fix applied to {os.path.basename(res_json.get('file',''))}")
+                    if res_json.get("backup"):
+                        st.info(f"Backup created: {res_json['backup']}")
+                    if res_json.get("diff"):
+                        with st.expander("View diff"):
+                            st.code(res_json.get("diff"), language="diff")
+                else:
+                    st.error(res_json.get("message", "Failed to apply fix"))
+        with c2:
+            st.button("Dismiss", key=f"dismiss_{i}")
 
 # Add footer
 st.markdown("---")

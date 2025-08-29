@@ -1,6 +1,46 @@
 # Agentic LogAI Debugger
 
-A modern analytics Log Analyzer and Code Fix Tool built with Streamlit, featuring data visualization and analysis capabilities.
+A modern Log Analyzer and Code Fix Tool. This repo now includes a React (Vite) frontend and a FastAPI backend, alongside the original Streamlit tooling.
+
+## 🚀 Quick start (React + FastAPI)
+
+1) Backend (FastAPI)
+- Create a virtualenv and install deps
+  - Windows PowerShell:
+    - python -m venv venv
+    - .\venv\Scripts\Activate.ps1
+    - pip install -r requirements.txt
+- Create a .env in repo root as needed (see Keys section below)
+- Start API on 127.0.0.1:8000
+  - python -m uvicorn backend.services.main:app --host 127.0.0.1 --port 8000 --reload
+
+2) Frontend (Vite + React, JavaScript only)
+- cd frontend
+- npm install
+- npm run dev
+- Open http://localhost:5173 (the dev server proxies /api/* → 127.0.0.1:8000)
+
+### Log file upload workflow (file source)
+- Go to Logs page in the React app
+- Click “Upload log file (file source)” and choose a .log/.txt file
+- The backend stores it under data/uploads/<timestamp>_<name> and sets it as the active file
+- The current Active file line shows path/size/mtime; queries against source=file use this file
+- Metrics and labels also honor this active file when source=file
+
+Tip: You can still point at your own file path via POST /api/logs/source with {"path": "C:\\path\\to\\my.log"}
+
+### Keys and LLM Providers
+The toolkit supports multiple providers; set whichever you have:
+- OPENAI_API_KEY=...
+- GROQ_API_KEY=...
+- GOOGLE_API_KEY=...
+
+Place keys in .env (repo root). Backend loads .env at startup.
+
+### Troubleshooting
+- Address already in use: ensure ports 8000/5173 are free or change ports.
+- IPv6/loopback quirks on Windows: bind FastAPI to 127.0.0.1 and keep the Vite proxy default.
+- 500 on frontend calls: confirm backend is running (health: GET /api/health).
 
 ## 📸 Screenshots
 
@@ -61,14 +101,13 @@ The application uses several key packages:
 - `langchain-community>=0.0.10`: AI/ML workflow management
 - `python-dotenv>=1.0.0`: Environment variable management
 
-## Running the Application
+## Running the Streamlit App (legacy option)
 
-To start the application, run:
-```bash
-streamlit run app.py
-```
+You can still use the Streamlit UI used earlier in this project:
 
-The application will open in your default web browser at `http://localhost:8501`.
+- streamlit run app.py
+
+This opens http://localhost:8501.
 
 ## Environment Variables
 
@@ -194,6 +233,16 @@ To run the analytics dashboard:
    ```
 
 The dashboard will be available at [http://localhost:8501](http://localhost:8501).
+
+### React + FastAPI details
+
+- Backend entry: backend/services/main.py (FastAPI)
+- Frontend: frontend/ (Vite + React, JS only)
+- Proxy: Vite dev server proxies /api/* to 127.0.0.1:8000
+- Upload & source endpoints:
+  - GET /api/logs/source → { active_file, exists, size, mtime }
+  - POST /api/logs/source { path } → set active file
+  - POST /api/logs/upload (multipart file) → store under data/uploads and set active file
 
 ## Contributing
 

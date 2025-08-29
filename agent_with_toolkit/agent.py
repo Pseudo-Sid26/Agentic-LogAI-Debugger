@@ -1,7 +1,7 @@
-from langchain.chat_models import ChatOpenAI
+from langchain_community.chat_models import ChatOpenAI
 import json
 import time
-from langchain_openai import ChatOpenAI
+import os
 from langchain.agents import AgentExecutor, create_openai_tools_agent
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.memory import ConversationBufferMemory
@@ -11,14 +11,13 @@ from dotenv import load_dotenv
 from ToolKit import (
     create_enhanced_tools,
     save_analysis_to_json,
+    apply_code_fix,
 )
 
 load_dotenv()
 
-llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    temperature=0.2  # Lower temperature for more deterministic outputs
-)
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+llm = ChatOpenAI(model=OPENAI_MODEL, temperature=float(os.getenv("LLM_TEMPERATURE", "0.2")))
 
 # Enhanced prompt with more context requirements
 prompt = ChatPromptTemplate.from_messages([
@@ -94,6 +93,55 @@ def analyze_logs(query="Find all log files and analyze them in detail for errors
         print(f"Analysis saved to {filename}")
     
     return res
+
+
+def apply_fix_with_agent(error: dict) -> dict:
+    """Ask the agent to execute apply_code_fix for a given error object.
+
+    If no API key is available, falls back to directly calling apply_code_fix.
+    Returns a parsed JSON dict with success/message fields.
+    """
+    try:
+        payload = {
+            "file_location": error.get("file_location", ""),
+            "related_code": error.get("related_code", ""),
+            "code_suggestion": error.get("code_suggestion", ""),
+            "create_backup": True,
+        }
+
+        # Fallback path: no API key, call the tool directly
+        if not os.getenv("OPENAI_API_KEY"):
+            res = apply_code_fix(
+                file_path=payload["file_location"],
+                related_code=payload["related_code"],
+                code_suggestion=payload["code_suggestion"],
+                create_backup=True,
+            )
+            return json.loads(res)
+
+        # Use the agent so the tool is executed within the agent workflow
+        agent_executor = create_agent()
+        instruction = (
+            "Use the tool apply_code_fix to apply the provided fix. "
+            "Respond ONLY with the raw JSON returned by the tool. "
+            f"Here is the payload as JSON: {json.dumps(payload)}"
+        )
+        result = agent_executor.invoke({"input": instruction})
+        # The tool returns a JSON string; try to parse from output
+        output = result.get("output") or ""
+        try:
+            return json.loads(output)
+        except Exception:
+            # As a last resort, apply directly
+            res = apply_code_fix(
+                file_path=payload["file_location"],
+                related_code=payload["related_code"],
+                code_suggestion=payload["code_suggestion"],
+                create_backup=True,
+            )
+            return json.loads(res)
+    except Exception as e:
+        return {"success": False, "message": f"apply_fix_with_agent error: {e}"}
 
 # Example usage
 if __name__ == "__main__":
